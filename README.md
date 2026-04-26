@@ -16,3 +16,4 @@ It uses fully offline local storage for your chats, so you are responsible for y
 ### ⦿ What's the point if it's offline storage?
 This is more of a chat app than a workspace. Mirror was originally created for creative writing but it is also suitable for those who enjoy a personal friend like 4o before it was deprecated. I wanted an app that handled memory, context, and lookup tools - without paying for a subscription hosting service.
 
+(more added later...)
