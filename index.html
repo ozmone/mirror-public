@@ -120,12 +120,12 @@ const DEFAULT_SETTINGS = {
   theme: "mono",
   accentColor: "#C8C8C8",
   fontFamily: "Noto Serif",
-  fontSize: 14,
+  fontSize: 12,
   chatBubbleMaxWidth: 97,
   userBubbleAccentTab: false,
-  model: "openai/gpt-5.5",
+  model: "openai/gpt-4.1-2025-04-14",
   defaultApiProvider: "openrouter",
-  defaultModel: "openai/gpt-5.5",
+  defaultModel: "openai/gpt-4.1-2025-04-14",
   models: [], // legacy OpenRouter model list fallback
   openrouterModels: [],
   openaiModels: [],
@@ -144,7 +144,7 @@ const DEFAULT_PROJECT = {
   model: "",
   inventory: { credits: 0, items: [] },
   memory: [],
-  memorySettings: { type: "factual", retention: "manual", allowLookup: true, allowInventoryUpdates: false, pendingLimit: 500 },
+  memorySettings: { type: "fiction", retention: "manual", allowLookup: true, allowInventoryUpdates: true, pendingLimit: 500 },
   files: [],
   characters: [],
   createdAt: Date.now(),
@@ -277,8 +277,10 @@ const BUILTIN_MODELS = [
   "openai/gpt-4o-2024-11-20",
   "openai/gpt-4o-mini",
   "openai/gpt-4.1-2025-04-14",
+  "openai/gpt-4.5-preview",
   "anthropic/claude-sonnet-4-5",
   "anthropic/claude-haiku-4-5",
+  "google/gemini-2.0-flash-001",
   "google/gemini-2.5-pro",
   "google/gemini-2.5-flash",
   "meta-llama/llama-3.3-70b-instruct",
@@ -512,7 +514,7 @@ const getClosestContextOptionIndex = (value) => {
 const getContextOptionByIndex = (index) =>
   CONTEXT_MESSAGE_COUNT_OPTIONS[Math.max(0, Math.min(CONTEXT_MESSAGE_COUNT_OPTIONS.length - 1, Number(index) || 0))] || CONTEXT_MESSAGE_COUNT_OPTIONS[0];
 const formatContextOptionLabel = (value) => value == null ? "Unlimited" : String(value);
-const APP_VERSION = "1.0";
+const APP_VERSION = "1.0.0";
 const APP_VERSION_LABEL = `ver. ${APP_VERSION} APR/2026`;
 
 const normalizeSettings = (settings = {}) => {
@@ -2634,7 +2636,7 @@ function SettingsScreen({ t, settings, fonts, onBack, onSave, projects, activePr
         <div style={{ flex: 1, display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
           <span style={{ color: t.text, fontFamily: fonts.family, fontSize: 13, fontWeight: 600, paddingTop: 2 }}>Settings</span>
           <div style={{ textAlign: "right", lineHeight: 1.25 }}>
-            <div style={{ color: t.textMuted, fontFamily: fonts.family, fontSize: 10, fontStyle: "italic" }}>//</div>
+            <div style={{ color: t.textMuted, fontFamily: fonts.family, fontSize: 10, fontStyle: "italic" }}>// yule</div>
             <div style={{ color: t.textDim, fontFamily: fonts.family, fontSize: 9 }}>{APP_VERSION_LABEL}</div>
           </div>
         </div>
@@ -4113,7 +4115,7 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
         {messages.filter(m => m.role !== "system").length === 0 && (
           <div style={{ textAlign: "center", padding: "40px 20px" }}>
             <Icon d={ICONS.chat} size={28} stroke={t.textDim} />
-            <p style={{ color: t.textDim, fontFamily: fonts.family, fontSize: 11, marginTop: 12, lineHeight: 1.6 }}>{project.name}<br />STANDBY // New chat</p>
+            <p style={{ color: t.textDim, fontFamily: fonts.family, fontSize: 11, marginTop: 12, lineHeight: 1.6 }}>{project.name}<br />STANDBY // ENCRYPTED</p>
           </div>
         )}
         {messages.map((msg, i) => (
@@ -4265,7 +4267,7 @@ function Sidebar({ t, fonts, open, onClose, projects, chats, activeProjectId, ac
           <button onClick={onOpenSettings} style={{ width: "100%", display: "flex", alignItems: "center", gap: 8, padding: "9px 10px", background: "none", border: "none", cursor: "pointer", borderRadius: 8 }}>
             <Icon d={ICONS.settings} size={14} stroke={t.textMuted} />
             <span style={{ color: t.textMuted, fontFamily: fonts.family, fontSize: 11 }}>Settings</span>
-            <span style={{ marginLeft: "auto", color: t.textDim, fontFamily: fonts.family, fontSize: 10, fontStyle: "italic" }}>github.com/ozmone/mirror-public</span>
+            <span style={{ marginLeft: "auto", color: t.textDim, fontFamily: fonts.family, fontSize: 10, fontStyle: "italic" }}>// yule</span>
           </button>
         </div>
       </div>
