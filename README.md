@@ -21,6 +21,7 @@ All your data lives in your browser's local storage (IndexedDB). You are respons
 
 The app itself is free. You still pay for API usage through OpenAI or OpenRouter — Mirror doesn't add any markup or middleman costs.
 
+<img width="48" height="38" alt="image" src="https://github.com/user-attachments/assets/af9e9cfc-c8e8-4167-9f9c-2d83c56eae93" />
 If you want to donate to this project, my ko-fi link is https://ko-fi.com/saveoursouls# 
 
 ---
