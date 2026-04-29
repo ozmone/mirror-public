@@ -46,6 +46,8 @@ Mirror has a **per-project memory system** with full control over how memories a
 - Memories have **categories**, **importance ratings (1–5)**, **tags**, and statuses (`pending`, `active`, `archived`)
 - Memory **lookup is a tool call** — the model retrieves relevant memories on demand rather than stuffing everything into the context window
 
+  > Note: It's called "lookup" if you need the tell the AI you want it to *really look*. For e.g. "lookup my character Magniss" and it will actually look up that character. This is useful for project prompts such as "always use tools to lookup characters when they enter a scene."
+
 ---
 
 ### ⦿ Context Window Control
@@ -134,7 +136,8 @@ Mirror exposes OpenRouter's data routing options:
 # Screenshots:
 
 Chat (example using 4o)
-<img width="270" height="594" src="https://github.com/user-attachments/assets/51cf0393-19e7-46fb-ac14-5e84b04932ae" />
+<img width="270" height="594" src="https://github.com/user-attachments/assets/51cf0393-19e7-46fb-ac14-5e84b04932ae"><img width="324" height="324" src="https://github.com/user-attachments/assets/165b458a-836f-4344-8025-a3a3fc6e6df1" />
+
 -----
 Projects
 <img width="270" height="594" alt="image" src="https://github.com/user-attachments/assets/4299e8dd-a450-4549-8612-6e9b51aa5129" />
