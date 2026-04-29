@@ -664,7 +664,7 @@ const TRAINING_BONUS_PINK = "#ff7ac8";
 const TRAINING_BONUS_PINK_SOFT = "rgba(255,122,200,0.18)";
 const CLASS_BONUS_TEAL = "#3ccfd8";
 const CLASS_BONUS_TEAL_SOFT = "rgba(60,207,216,0.18)";
-const DEFAULT_CHARACTER_SETTINGS = { classesText: "", classBonuses: {}, scaleClassBonusesToLevel: false, maxClassLevel: 5 };
+const DEFAULT_CHARACTER_SETTINGS = { classesText: "", classBonuses: {}, scaleClassBonusesToLevel: false, classLabelAsLevel: false, maxClassLevel: 5 };
 const clampClassLevelMax = (value) => Math.max(1, Math.min(999, Math.round(Number(value) || DEFAULT_CHARACTER_SETTINGS.maxClassLevel)));
 const normalizeBonusStat = (value) => {
   const raw = String(value || "").trim().toUpperCase();
@@ -696,6 +696,7 @@ const normalizeCharacterSettings = (settings = {}) => {
     ...(settings || {}),
     classBonuses,
     scaleClassBonusesToLevel: !!settings?.scaleClassBonusesToLevel,
+    classLabelAsLevel: !!settings?.classLabelAsLevel,
     maxClassLevel: clampClassLevelMax(settings?.maxClassLevel),
   };
 };
@@ -1563,6 +1564,8 @@ const getClassBonuses = (settings = {}, classType = "", classLevel = 0) => {
     return { ...acc, [stat]: (acc[stat] || 0) + value };
   }, DEFAULT_CHARACTER_STATS.reduce((acc, stat) => ({ ...acc, [stat]: 0 }), {}));
 };
+const getClassDisplayLabel = (settings = {}) => settings?.classLabelAsLevel ? "Level" : "Class";
+
 const formatClassBonusInline = (settings = {}, classType = "", classLevel = 0) => {
   const bonuses = getClassBonuses(settings, classType, classLevel);
   const parts = DEFAULT_CHARACTER_STATS
@@ -1574,7 +1577,7 @@ const formatClassBonusDisplay = (settings = {}, classType = "", classLevel = 0) 
   const type = String(classType || "").trim();
   const level = Math.round(Number(classLevel) || 0);
   if (!type && !level) return "";
-  const label = level > 0 ? ["Class", level, type].filter(Boolean).join(" ") : type;
+  const label = level > 0 ? [getClassDisplayLabel(settings), level, type].filter(Boolean).join(" ") : type;
   return `${label}${formatClassBonusInline(settings, type, level)}`.trim();
 };
 
@@ -2627,6 +2630,14 @@ const getStatGradient = (value) => {
           <div style={{ minWidth: 0 }}>
             <div style={{ color: t.text, fontFamily: fonts.family, fontSize: 12, fontWeight: 800 }}>Scale bonus stats to class level</div>
             <div style={{ color: t.textDim, fontFamily: fonts.family, fontSize: 10.5, lineHeight: 1.45 }}>When enabled, class bonuses use Primary / Secondary / Tertiary picks and ignore custom bonus numbers unless that class is exempt.</div>
+          </div>
+        </label>
+
+        <label style={{ display: "flex", alignItems: "center", gap: 10, background: t.bgPanel, border: `1px solid ${settingsDraft.classLabelAsLevel ? t.borderAccent : t.border}`, borderRadius: 14, padding: "12px 14px", cursor: "pointer" }}>
+          <input type="checkbox" checked={!!settingsDraft.classLabelAsLevel} onChange={e => saveSettingsDraft({ ...settingsDraft, classLabelAsLevel: e.target.checked })} />
+          <div style={{ minWidth: 0 }}>
+            <div style={{ color: t.text, fontFamily: fonts.family, fontSize: 12, fontWeight: 800 }}>Show class label as level</div>
+            <div style={{ color: t.textDim, fontFamily: fonts.family, fontSize: 10.5, lineHeight: 1.45 }}>Purely cosmetic. Character display lines use “Level 5 Striker” instead of “Class 5 Striker”.</div>
           </div>
         </label>
 
