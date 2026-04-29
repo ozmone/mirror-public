@@ -4,6 +4,8 @@
 
 Mirror is a **free**, **open-source** web app compatible with [OpenAI](https://openai.com/api/) and [OpenRouter](https://openrouter.ai/) API keys, and installable as a phone app.
 
+https://github.com/ozmone/mirror-public/wiki/User-Guide   - read this for deeper user guide.
+
 ### No built-in guardrails!
 As a writer, it was difficult to talk to GPT 5.2+ models that have such heavy guardrails. So that's why I was frustrated and made Mirror app - a way to talk to 4o again as well as any other model I want.
 
