@@ -32,6 +32,8 @@ If you want to donate to this project, my ko-fi link is https://ko-fi.com/saveou
 
 > Installation on your phone: Specifically use a Chrome app on your phone, select the three dots next to the address, click "Add to homepage". You should get an option to "Install Mirror" which will make it work just like a real app and not a browser window.
 
+** NOTE: Compaction is disabled by default. Turn this ON if you want context windows! **
+
 ---
 
 ### ⦿ Memory System
