@@ -714,12 +714,17 @@ const normalizeProject = (project = {}) => {
     loreFiles: normalizeProjectLoreFiles(project?.loreFiles, merged.id),
     characterSettings: normalizeCharacterSettings(project?.characterSettings),
     projectGlobalContextWindow: !!project?.projectGlobalContextWindow,
-    projectCompaction: {
-      ...DEFAULT_PROJECT.projectCompaction,
-      ...(project?.projectCompaction || {}),
-      chunks: Array.isArray(project?.projectCompaction?.chunks) ? project.projectCompaction.chunks : [],
-    },
+    projectCompaction: normalizeCompactionState(project?.projectCompaction),
   };
+};
+
+const PROJECT_STATE_FIELDS = ["memory", "memorySettings", "projectCompaction", "characters", "loreFiles", "files", "inventory", "characterSettings"];
+const mergeProjectPreservingState = (existing = {}, patch = {}) => {
+  const merged = { ...(existing || {}), ...(patch || {}) };
+  PROJECT_STATE_FIELDS.forEach(field => {
+    if (!Object.prototype.hasOwnProperty.call(patch || {}, field)) merged[field] = existing?.[field];
+  });
+  return normalizeProject(merged);
 };
 
 const DEFAULT_CHAT_COMPACTION = {
@@ -729,12 +734,54 @@ const DEFAULT_CHAT_COMPACTION = {
   updatedAt: null,
 };
 
+const normalizeCompactionState = (compaction = {}) => {
+  const raw = compaction || {};
+  return {
+    ...DEFAULT_CHAT_COMPACTION,
+    ...raw,
+    chunks: Array.isArray(raw.chunks) ? raw.chunks.filter(Boolean) : [],
+  };
+};
+
+const chunkIdentity = (chunk = {}) =>
+  chunk.id || `${chunk.fromTs || ""}:${chunk.toTs || ""}:${chunk.count || ""}:${String(chunk.text || "").slice(0, 80)}`;
+
+const rangesOverlap = (a = {}, b = {}) => {
+  const aFrom = Number(a.fromTs) || 0;
+  const aTo = Number(a.toTs) || aFrom;
+  const bFrom = Number(b.fromTs) || 0;
+  const bTo = Number(b.toTs) || bFrom;
+  if (!aFrom || !bFrom) return false;
+  return aFrom <= bTo && bFrom <= aTo;
+};
+
+const mergeCompactionStates = (existing = {}, incoming = {}) => {
+  const current = normalizeCompactionState(existing);
+  const next = normalizeCompactionState(incoming);
+  const incomingChunks = next.chunks || [];
+  const mergedIncomingRanges = incomingChunks.filter(chunk => chunk?.merged || chunk?.rollupOf || chunk?.rolloverThreshold);
+  const keepExisting = (current.chunks || []).filter(oldChunk => {
+    const oldId = chunkIdentity(oldChunk);
+    if (incomingChunks.some(newChunk => chunkIdentity(newChunk) === oldId)) return false;
+    if (mergedIncomingRanges.some(newChunk => rangesOverlap(oldChunk, newChunk))) return false;
+    return true;
+  });
+  const byId = new Map();
+  [...keepExisting, ...incomingChunks].forEach(chunk => byId.set(chunkIdentity(chunk), chunk));
+  const chunks = Array.from(byId.values()).sort((a, b) => (Number(a.fromTs) || Number(a.createdAt) || 0) - (Number(b.fromTs) || Number(b.createdAt) || 0));
+  return normalizeCompactionState({
+    summary: next.summary || current.summary || "",
+    chunks,
+    compactedThroughTs: Math.max(Number(current.compactedThroughTs) || 0, Number(next.compactedThroughTs) || 0) || null,
+    updatedAt: Math.max(Number(current.updatedAt) || 0, Number(next.updatedAt) || 0, Date.now()),
+  });
+};
+
 const normalizeChat = (chat = {}) => {
-  const rawCompaction = { ...DEFAULT_CHAT_COMPACTION, ...(chat?.compaction || {}) };
   return {
     pinned: false, ...chat,
     options: { ...DEFAULT_CHAT_OPTIONS, ...(chat?.options || {}) },
-    compaction: { ...rawCompaction, chunks: Array.isArray(rawCompaction.chunks) ? rawCompaction.chunks : [] },
+    compaction: normalizeCompactionState(chat?.compaction),
   };
 };
 
@@ -1735,11 +1782,13 @@ const formatCharacterFieldsForModel = (char = {}, fields = [], includeRestricted
   if (requestedFields.includes("fullProfile")) return formatCharacterForModel(char, includeRestricted, characterSettings);
 
   const lines = [`## ${getSafeCharacterName(char, includeRestricted)}`];
-  const summaryValue = getVisibleCharacterValue(char, "summary", includeRestricted);
-  if (summaryValue) lines.push(`Summary: ${summaryValue}`);
 
   requestedFields.forEach(key => {
-    if (key === "summary") return;
+    if (key === "summary") {
+      const summaryValue = getVisibleCharacterValue(char, "summary", includeRestricted);
+      if (summaryValue) lines.push(`Summary: ${summaryValue}`);
+      return;
+    }
     if (key === "stats") {
       const statsLine = formatStatsForModel(char, characterSettings);
       if (statsLine) lines.push(`Stats: ${statsLine}`);
@@ -3985,8 +4034,21 @@ function ProjectScreen({ t, fonts, projects, setProjects, activeProjectId, setAc
 
   const saveDraftProject = () => {
     if (!draftProject) return;
-    const exists = projects.some(p => p.id === draftProject.id);
-    const nextProject = normalizeProject(draftProject);
+    const existingProject = projects.find(p => p.id === draftProject.id);
+    const exists = !!existingProject;
+    const nextProject = exists
+      ? normalizeProject({
+          ...existingProject,
+          ...draftProject,
+          memory: existingProject.memory,
+          projectCompaction: existingProject.projectCompaction,
+          characters: existingProject.characters,
+          loreFiles: existingProject.loreFiles,
+          files: existingProject.files,
+          inventory: existingProject.inventory,
+          memorySettings: normalizeMemorySettings(draftProject.memorySettings || existingProject.memorySettings),
+        })
+      : normalizeProject(draftProject);
     const next = exists ? projects.map(p => p.id === nextProject.id ? nextProject : p) : [...projects, nextProject];
     setProjects(next); storage.set(STORAGE_KEYS.PROJECTS, next);
     if (!activeProjectId) setActiveProjectId(nextProject.id);
@@ -4469,10 +4531,11 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
   const chatCompaction = { ...DEFAULT_CHAT_COMPACTION, ...(chat?.compaction || {}), chunks: Array.isArray(chat?.compaction?.chunks) ? chat.compaction.chunks : [] };
   const projectCompaction = { ...DEFAULT_CHAT_COMPACTION, ...(project?.projectCompaction || {}), chunks: Array.isArray(project?.projectCompaction?.chunks) ? project.projectCompaction.chunks : [] };
   const activeCompactionState = projectGlobalContextEnabled ? projectCompaction : chatCompaction;
-  const updateActiveCompaction = (nextCompaction) => {
-    const normalized = { ...DEFAULT_CHAT_COMPACTION, ...(nextCompaction || {}), chunks: Array.isArray(nextCompaction?.chunks) ? nextCompaction.chunks : [] };
-    if (projectGlobalContextEnabled) onUpdateProjectCompaction?.(normalized);
-    else onUpdateChatCompaction?.(normalized);
+  const updateActiveCompaction = (nextCompaction, options = {}) => {
+    const normalized = normalizeCompactionState(nextCompaction);
+    const payload = { ...normalized, __merge: !options.replace, __replace: !!options.replace };
+    if (projectGlobalContextEnabled) onUpdateProjectCompaction?.(payload);
+    else onUpdateChatCompaction?.(payload);
   };
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
@@ -4551,7 +4614,7 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
       availableTools.push(`Pending memory queue is full (${pendingMemories.length}/${memorySettings.pendingLimit}). Do not propose new memories until the user reviews this project.`);
     }
     if (chatOptions.allowCharacterLookup && activeCharacters.length && !chatOptions.includeCharactersInPrompt) {
-      availableTools.push(`Characters available for lookup: ${activeCharacters.map(c => getSafeCharacterName(c)).join(", ")}. Use lookup_character to request only the fields needed instead of full profiles. Summary is automatically included with every character lookup. Available character fields: ${getCharacterLookupFieldMenu()}. Use stats for checks/rolls; stats includes class bonuses plus training bonus totals and sources. Use trainingBonuses when you need only the bonus rows.`);
+      availableTools.push(`Characters available for lookup: ${activeCharacters.map(c => getSafeCharacterName(c)).join(", ")}. Use lookup_character to request only the fields needed instead of full profiles. Request summary only when narrative context is needed. Available character fields: ${getCharacterLookupFieldMenu()}. Use stats for checks/rolls; stats includes class bonuses plus training bonus totals and sources. Use trainingBonuses when you need only the bonus rows.`);
     }
     if (chatOptions.allowProjectFileLookup && activeFiles.length && !chatOptions.includeProjectFilesInPrompt) {
       availableTools.push(`Project files available for lookup: ${activeFiles.map(f => f.name).join(", ")}`);
@@ -4561,6 +4624,7 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
     }
     if (availableTools.length) {
       blocks.push(`## Available Lookup Tools\nUse these tools when you need specific details — do not guess.\n${availableTools.map(l => `- ${l}`).join("\n")}`);
+      blocks.push("## Tool Follow-Through\nTool results are intermediate information, not the final answer. After any lookup or tool result, continue the user's original request in the same response. Use the returned data to complete the action, calculation, narration, comparison, edit, explanation, or next requested step. Do not stop after merely repeating what the tool returned.");
     }
 
     return blocks.filter(Boolean).join("\n\n");
@@ -4627,14 +4691,14 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
       type: "function",
       function: {
         name: "lookup_character",
-        description: "Search the active project's character database and return only the requested character fields. Summary is always included automatically. Choose field names from the provided enum instead of asking for the whole profile unless fullProfile is truly needed.",
+        description: "Search the active project's character database and return only the requested character fields. Request summary only when summary is needed. Choose field names from the provided enum instead of asking for the whole profile unless fullProfile is truly needed.",
         parameters: {
           type: "object",
           properties: {
             query: { type: "string", description: "Alias, sender ID, role, faction, tag, or any descriptive phrase." },
             fields: {
               type: "array",
-              description: "Specific fields to retrieve. Summary is returned automatically on every lookup, so do not request summary unless it is the main thing needed. Request the smallest useful set. The stats field includes training bonus totals and sources. Use fullProfile only when broad continuity context is needed.",
+              description: "Specific fields to retrieve. Request the smallest useful set. Use stats for checks, rolls, and mechanics. Request summary only when narrative context is needed. The stats field includes training bonus totals and sources. Use fullProfile only when broad continuity context is needed.",
               items: { type: "string", enum: CHARACTER_LOOKUP_FIELDS },
             },
           },
@@ -4708,7 +4772,11 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
       const incoming = normalizeMemory({ id: makeId(isReview ? "mem_pending" : "mem_auto"), projectId: project.id, content: String(args.content).trim(), category: args.category || (memorySettings.type === "fiction" ? "world" : "other"), tags: Array.isArray(args.tags) ? args.tags : [], importance: args.importance || 3, status: isReview ? "pending" : "active", source: isReview ? "auto-review" : "auto", reason: args.reason || "", createdAt: now, updatedAt: now }, project.id);
       const duplicate = mems.some(m => getMemoryContent(m).toLowerCase() === incoming.content.toLowerCase());
       if (duplicate) return "Memory not stored: duplicate already exists in this project.";
-      onUpdateMemory([...mems, incoming]);
+      onUpdateMemory((currentMemory = []) => {
+        const currentMems = normalizeProjectMemory(currentMemory || [], project.id);
+        const alreadyStored = currentMems.some(m => getMemoryContent(m).toLowerCase() === incoming.content.toLowerCase());
+        return alreadyStored ? currentMems : [...currentMems, incoming];
+      });
       return isReview ? `Memory proposed for review: "${incoming.content}"` : `Memory saved: "${incoming.content}"`;
     }
 
@@ -4906,17 +4974,19 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
     const safeMaxChunks = Math.max(1, Number(maxChunks) || DEFAULT_CHAT_OPTIONS.compactionMaxChunks);
     let nextChunks = Array.isArray(chunks) ? [...chunks] : [];
 
-    // Max Summary Chunks is the rollover threshold, not the final stored count.
-    // Example: max 5 means chunks 1-5 collapse into one rolling master chunk,
-    // leaving 4 clear slots for fresh batch summaries. Then master + 4 fresh chunks
-    // collapse again. This prevents endless 5/6/10 chunk buildup.
+    // Max Summary Chunks is a rollover threshold. Preserve the newest chunks separately
+    // and only compress older overflow into a rolling master chunk so recent continuity
+    // does not get repeatedly re-summarized.
     const shouldRollUp = () => {
       if (nextChunks.length <= 1) return false;
       return safeMaxChunks <= 1 ? nextChunks.length > 1 : nextChunks.length >= safeMaxChunks;
     };
 
     while (shouldRollUp()) {
-      const chunksToMerge = nextChunks;
+      const recentToKeep = safeMaxChunks <= 2 ? 1 : Math.min(2, safeMaxChunks - 1);
+      const mergeCount = safeMaxChunks <= 1 ? nextChunks.length : Math.max(1, nextChunks.length - recentToKeep);
+      const chunksToMerge = nextChunks.slice(0, mergeCount);
+      const chunksToKeep = nextChunks.slice(mergeCount);
       const mergedText = await requestChunkMerge({ chunksToMerge, maxTokens });
       const mergedChunk = {
         id: makeId("cmp_chunk"),
@@ -4926,9 +4996,10 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
         text: mergedText,
         createdAt: Date.now(),
         merged: true,
+        rollupOf: chunksToMerge.map(chunk => chunkIdentity(chunk)),
         rolloverThreshold: safeMaxChunks,
       };
-      nextChunks = [mergedChunk];
+      nextChunks = [mergedChunk, ...chunksToKeep];
     }
 
     return nextChunks;
@@ -4979,7 +5050,7 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
       return getContextMessages(baseMessages, activeCompaction, unCompactedMessages);
     }
   };
-  const resetChatCompaction = () => updateActiveCompaction({ ...DEFAULT_CHAT_COMPACTION });
+  const resetChatCompaction = () => updateActiveCompaction({ ...DEFAULT_CHAT_COMPACTION }, { replace: true });
 
   const buildRequestPayload = (requestMessages) => {
     const payload = {
@@ -5091,27 +5162,79 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
     return assistantMsg;
   };
 
+  const runToolLoop = async ({ initialRequestMessages, initialUiMessages, firstAssistantMsg, maxRounds = 4 }) => {
+    let requestMessages = [...initialRequestMessages];
+    let uiMessages = [...initialUiMessages];
+    let assistantMsg = firstAssistantMsg;
+
+    for (let round = 0; round < maxRounds; round++) {
+      if (!assistantMsg?.tool_calls?.length) {
+        const finalMessages = [...uiMessages, assistantMsg];
+        setMessages(finalMessages); persistMessages(finalMessages);
+        return finalMessages;
+      }
+
+      const toolMessages = assistantMsg.tool_calls.map(tc => ({
+        role: "tool",
+        tool_call_id: tc.id,
+        tool_name: tc.function?.name,
+        content: handleToolCall(tc),
+        ts: Date.now(),
+      }));
+
+      uiMessages = [...uiMessages, assistantMsg, ...toolMessages];
+      setMessages(uiMessages); persistMessages(uiMessages);
+
+      requestMessages = [
+        ...requestMessages,
+        { role: "assistant", content: assistantMsg.content || "", ...(assistantMsg.tool_calls ? { tool_calls: assistantMsg.tool_calls } : {}) },
+        ...toolMessages.map(m => ({ role: "tool", tool_call_id: m.tool_call_id, content: m.content })),
+      ];
+
+      if (chatOptions.streamOutput) {
+        assistantMsg = await streamChatCompletion({ requestMessages, uiBaseMessages: uiMessages });
+      } else {
+        const followPayload = buildRequestPayload(requestMessages);
+        const followUp = await fetch(apiUrl, { method: "POST", headers, body: JSON.stringify(followPayload) });
+        const followData = await followUp.json();
+        if (!followUp.ok) throw new Error(followData.error?.message || "API error");
+        const msg = followData.choices?.[0]?.message || {};
+        const content = msg.content || "";
+        assistantMsg = {
+          role: "assistant",
+          content,
+          tool_calls: msg.tool_calls || undefined,
+          ts: Date.now(),
+          tokenCount: followData.usage?.completion_tokens ?? estimateTokens(content),
+          tokenEstimated: followData.usage?.completion_tokens == null,
+        };
+      }
+    }
+
+    const warning = {
+      role: "assistant",
+      content: "⚠ Tool chain stopped after too many tool rounds. Try the request again more directly.",
+      ts: Date.now(),
+      tokenCount: 20,
+      tokenEstimated: true,
+      error: true,
+    };
+    const finalMessages = [...uiMessages, warning];
+    setMessages(finalMessages); persistMessages(finalMessages);
+    return finalMessages;
+  };
+
   const requestAssistant = async (baseMessages) => {
     const requestMessages = await prepareRequestMessages(baseMessages);
 
     if (chatOptions.streamOutput) {
       const assistantMsg = await streamChatCompletion({ requestMessages, uiBaseMessages: baseMessages });
       if (assistantMsg.tool_calls?.length) {
-        const toolMessages = assistantMsg.tool_calls.map(tc => ({
-          role: "tool", tool_call_id: tc.id, tool_name: tc.function?.name,
-          content: handleToolCall(tc), ts: Date.now(),
-        }));
-        const withTools = [...baseMessages, assistantMsg, ...toolMessages];
-        setMessages(withTools); persistMessages(withTools);
-        const followRequestMessages = [
-          ...requestMessages,
-          { role: "assistant", content: assistantMsg.content, ...(assistantMsg.tool_calls ? { tool_calls: assistantMsg.tool_calls } : {}) },
-          ...toolMessages.map(m => ({ role: "tool", tool_call_id: m.tool_call_id, content: m.content })),
-        ];
-        const followAssistant = await streamChatCompletion({ requestMessages: followRequestMessages, uiBaseMessages: withTools });
-        const finalMessages = [...withTools, followAssistant];
-        setMessages(finalMessages); persistMessages(finalMessages);
-        return finalMessages;
+        return await runToolLoop({
+          initialRequestMessages: requestMessages,
+          initialUiMessages: baseMessages,
+          firstAssistantMsg: assistantMsg,
+        });
       }
       const finalMessages = [...baseMessages, assistantMsg];
       setMessages(finalMessages); persistMessages(finalMessages);
@@ -5134,33 +5257,11 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
         tokenCount: firstPassTokens ?? estimateTokens(assistantMsg.content || ""),
         tokenEstimated: firstPassTokens == null,
       };
-      const toolMessages = assistantMsg.tool_calls.map(tc => ({
-        role: "tool", tool_call_id: tc.id, tool_name: tc.function?.name,
-        content: handleToolCall(tc), ts: Date.now(),
-      }));
-      const withTools = [...baseMessages, assistantToolMsg, ...toolMessages];
-      setMessages(withTools); persistMessages(withTools);
-
-      const followUp = await fetch(apiUrl, {
-        method: "POST", headers,
-        body: JSON.stringify({
-          ...payload,
-          messages: [
-            { role: "system", content: buildSystemPrompt() },
-            ...requestMessages,
-            { role: "assistant", content: assistantToolMsg.content, ...(assistantToolMsg.tool_calls ? { tool_calls: assistantToolMsg.tool_calls } : {}) },
-            ...toolMessages.map(m => ({ role: "tool", tool_call_id: m.tool_call_id, content: m.content })),
-          ],
-        }),
+      return await runToolLoop({
+        initialRequestMessages: requestMessages,
+        initialUiMessages: baseMessages,
+        firstAssistantMsg: assistantToolMsg,
       });
-      const followData = await followUp.json();
-      if (!followUp.ok) throw new Error(followData.error?.message || "API error");
-
-      const finalMsg = followData.choices?.[0]?.message?.content || "";
-      const followTokens = followData.usage?.completion_tokens;
-      const finalMessages = [...withTools, { role: "assistant", content: finalMsg, ts: Date.now(), tokenCount: followTokens ?? estimateTokens(finalMsg), tokenEstimated: followTokens == null }];
-      setMessages(finalMessages); persistMessages(finalMessages);
-      return finalMessages;
     }
 
     const aiText = assistantMsg?.content || "";
@@ -5402,7 +5503,7 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
       {showChars && <CharacterModal t={t} fonts={fonts} project={project} onClose={() => setShowChars(false)} onUpdate={(chars) => onUpdateCharacters(chars)} onUpdateSettings={(settings) => onUpdateProjectSettings?.(settings)} onUpdateLoreFiles={(loreFiles) => onUpdateLoreFiles?.(loreFiles)} />}
       {showTune && <ChatTuneModal t={t} fonts={fonts} options={chatOptions} onClose={() => setShowTune(false)} onSave={(nextOptions) => onSaveChatOptions(nextOptions)} onExportChat={handleExportChat} onImportChat={handleImportChat} importStatus={importStatus} onManageCompaction={() => { setShowTune(false); setShowCompactionChunks(true); }} />}
       {showImageSettings && <ImageSettingsModal t={t} fonts={fonts} options={chatOptions} settings={settings} apiProvider={apiProvider} providerKey={apiKey} onClose={() => setShowImageSettings(false)} onSave={(nextOptions) => onSaveChatOptions(nextOptions)} />}
-      {showCompactionChunks && <CompactionChunksScreen t={t} fonts={fonts} chat={{ ...chat, compaction: activeCompactionState }} onBack={() => setShowCompactionChunks(false)} onSave={(nextCompaction) => updateActiveCompaction(nextCompaction)} />}
+      {showCompactionChunks && <CompactionChunksScreen t={t} fonts={fonts} chat={{ ...chat, compaction: activeCompactionState }} onBack={() => setShowCompactionChunks(false)} onSave={(nextCompaction) => updateActiveCompaction(nextCompaction, { replace: true })} />}
 
       <div style={{ flex: 1, overflowY: "auto", padding: "12px 8px 8px" }}>
         {messages.filter(m => m.role !== "system").length === 0 && (
@@ -5783,9 +5884,26 @@ function App() {
 
   const renameChat = (id, title) => setChats(prev => prev.map(c => c.id === id ? normalizeChat({ ...c, title: (title || "").trim() || "Untitled", autoTitle: false, updatedAt: Date.now() }) : c));
   const togglePinChat = (id) => setChats(prev => prev.map(c => c.id === id ? normalizeChat({ ...c, pinned: !c.pinned, updatedAt: Date.now() }) : c));
-  const updateProjectField = (id, field, value) => setProjects(prev => prev.map(p => p.id === id ? normalizeProject({ ...p, [field]: value }) : p));
+  const updateProjectField = (id, field, value) => setProjects(prev => prev.map(p => {
+    if (p.id !== id) return p;
+    const resolvedValue = typeof value === "function" ? value(p?.[field], p) : value;
+    if (field === "projectCompaction") {
+      const shouldMerge = !!resolvedValue?.__merge && !resolvedValue?.__replace;
+      const cleanValue = { ...(resolvedValue || {}) };
+      delete cleanValue.__merge; delete cleanValue.__replace;
+      return mergeProjectPreservingState(p, { [field]: shouldMerge ? mergeCompactionStates(p.projectCompaction, cleanValue) : normalizeCompactionState(cleanValue) });
+    }
+    return mergeProjectPreservingState(p, { [field]: resolvedValue });
+  }));
   const saveChatOptions = (chatId, nextOptions) => setChats(prev => prev.map(c => c.id === chatId ? normalizeChat({ ...c, options: { ...DEFAULT_CHAT_OPTIONS, ...(c.options || {}), ...(nextOptions || {}) }, updatedAt: Date.now() }) : c));
-  const saveChatCompaction = (chatId, nextCompaction) => setChats(prev => prev.map(c => c.id === chatId ? normalizeChat({ ...c, compaction: { ...DEFAULT_CHAT_COMPACTION, ...(nextCompaction || {}) }, updatedAt: Date.now() }) : c));
+  const saveChatCompaction = (chatId, nextCompaction) => setChats(prev => prev.map(c => {
+    if (c.id !== chatId) return c;
+    const shouldMerge = !!nextCompaction?.__merge && !nextCompaction?.__replace;
+    const cleanCompaction = { ...(nextCompaction || {}) };
+    delete cleanCompaction.__merge; delete cleanCompaction.__replace;
+    const compaction = shouldMerge ? mergeCompactionStates(c.compaction, cleanCompaction) : normalizeCompactionState(cleanCompaction);
+    return normalizeChat({ ...c, compaction, updatedAt: Date.now() });
+  }));
   const persistMessagesForChat = (chatId, msgs) => {
     if (!chatId) return;
     setAllMessages(prev => {
@@ -5892,7 +6010,7 @@ function App() {
               {MODELS.map(m => (
                   <button key={m} onClick={() => {
                     if (activeProject?.id) {
-                      setProjects(prev => prev.map(p => p.id === activeProject.id ? normalizeProject({ ...p, apiProvider: activeModelProvider, model: m }) : p));
+                      setProjects(prev => prev.map(p => p.id === activeProject.id ? mergeProjectPreservingState(p, { apiProvider: activeModelProvider, model: m }) : p));
                     } else {
                       setSettings(s => normalizeSettings({ ...s, apiProvider: activeModelProvider, model: m }));
                     }
