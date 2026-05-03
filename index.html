@@ -4561,6 +4561,11 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
   const chatCompaction = { ...DEFAULT_CHAT_COMPACTION, ...(chat?.compaction || {}), chunks: Array.isArray(chat?.compaction?.chunks) ? chat.compaction.chunks : [] };
   const projectCompaction = { ...DEFAULT_CHAT_COMPACTION, ...(project?.projectCompaction || {}), chunks: Array.isArray(project?.projectCompaction?.chunks) ? project.projectCompaction.chunks : [] };
   const activeCompactionState = projectGlobalContextEnabled ? projectCompaction : chatCompaction;
+  const activeCompactionRef = useRef(activeCompactionState);
+  useEffect(() => { activeCompactionRef.current = activeCompactionState; }, [activeCompactionState]);
+
+  const getActiveCompactionSnapshot = () => normalizeCompactionState(activeCompactionRef.current || activeCompactionState);
+
   const updateActiveCompaction = (nextCompaction, options = {}) => {
     const forceEmpty = !!nextCompaction?.__forceEmpty || !!options.forceEmpty;
     const normalized = normalizeCompactionState(stripCompactionControlFlags(nextCompaction));
@@ -4568,6 +4573,11 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
     // Blank/default compaction is allowed as a read fallback, but it must never be
     // persisted as real project/chat state unless an intentional reset says so.
     if (isCompactionEmptyState(normalized) && !forceEmpty) return;
+
+    // Keep a synchronous copy for the current send/edit cycle. React state updates
+    // do not land immediately, so editing then sending could otherwise read the
+    // old chunks and hang in compaction against a stale branch.
+    activeCompactionRef.current = normalized;
 
     const payload = { ...normalized, __merge: !options.replace, __replace: !!options.replace, __forceEmpty: forceEmpty };
     if (projectGlobalContextEnabled) onUpdateProjectCompaction?.(payload);
@@ -4953,7 +4963,7 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
 
   const getContextMessages = (baseMessages = [], compactionOverride = null, pendingMessages = []) => {
     const { recentMessages } = getContextSlices(baseMessages);
-    const compaction = { ...activeCompactionState, ...(compactionOverride || {}) };
+    const compaction = { ...getActiveCompactionSnapshot(), ...(compactionOverride || {}) };
     const summary = chatOptions.compactionEnabled && chatOptions.maxContextMessages != null ? serializeCompactionChunks(compaction) : "";
     const summaryMessages = summary ? [{
       role: "system",
@@ -4982,8 +4992,12 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
       ],
       temperature: 0, top_p: 1, max_tokens: safeMaxTokens, ...providerPrivacyFields,
     };
-    const res = await fetchWithTimeout(apiUrl, { method: "POST", headers, body: JSON.stringify(payload) });
-    const data = await res.json();
+    const { res, data } = await fetchJsonWithTimeout(
+      apiUrl,
+      { method: "POST", headers, body: JSON.stringify(payload) },
+      COMPACTION_REQUEST_TIMEOUT_MS,
+      "Compaction timed out before the assistant reply could start. Clear chat compaction, lower the compaction batch size, or try another model/provider."
+    );
     if (!res.ok) throw new Error(data.error?.message || "Compaction API error");
     return enforceCompactionBudget(data.choices?.[0]?.message?.content || "", safeMaxTokens);
   };
@@ -5003,8 +5017,12 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
       ],
       temperature: 0, top_p: 1, max_tokens: safeMaxTokens, ...providerPrivacyFields,
     };
-    const res = await fetchWithTimeout(apiUrl, { method: "POST", headers, body: JSON.stringify(payload) });
-    const data = await res.json();
+    const { res, data } = await fetchJsonWithTimeout(
+      apiUrl,
+      { method: "POST", headers, body: JSON.stringify(payload) },
+      COMPACTION_REQUEST_TIMEOUT_MS,
+      "Compaction chunk merge timed out before the assistant reply could start. Clear chat compaction or reduce Max Summary Chunks."
+    );
     if (!res.ok) throw new Error(data.error?.message || "Chunk merge API error");
     const fallback = chunksToMerge.map(c => c.text || "").join("\n\n");
     return enforceCompactionBudget(data.choices?.[0]?.message?.content || fallback, safeMaxTokens);
@@ -5058,7 +5076,8 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
 
     const safeMaxTokens = normalizeSummaryTokenBudget(chatOptions.compactionMaxTokens);
     const safeMaxChunks = Math.max(1, Number(chatOptions.compactionMaxChunks) || DEFAULT_CHAT_OPTIONS.compactionMaxChunks);
-    let activeCompaction = { ...DEFAULT_CHAT_COMPACTION, ...activeCompactionState, chunks: Array.isArray(activeCompactionState.chunks) ? activeCompactionState.chunks : [] };
+    const compactionSnapshot = getActiveCompactionSnapshot();
+    let activeCompaction = { ...DEFAULT_CHAT_COMPACTION, ...compactionSnapshot, chunks: Array.isArray(compactionSnapshot.chunks) ? compactionSnapshot.chunks : [] };
 
     const existingChunksNeedRollup = activeCompaction.chunks.length > 1 && (safeMaxChunks <= 1 ? activeCompaction.chunks.length > 1 : activeCompaction.chunks.length >= safeMaxChunks);
     if (existingChunksNeedRollup) {
@@ -5067,7 +5086,8 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
         activeCompaction = { ...activeCompaction, chunks: rolledChunks, updatedAt: Date.now() };
         updateActiveCompaction(activeCompaction);
       } catch (error) {
-        console.warn("Stored chunk rollup failed; continuing with existing chunks.", error);
+        console.warn("Stored chunk rollup failed; stopping reply because compaction is required.", error);
+        throw new Error("Stored compaction chunk rollup failed: " + (error.message || error));
       }
     }
 
@@ -5086,11 +5106,43 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
       updateActiveCompaction(nextCompaction);
       return getContextMessages(baseMessages, nextCompaction, pendingMessages);
     } catch (error) {
-      console.warn("Chat compaction failed; continuing with existing context.", error);
-      return getContextMessages(baseMessages, activeCompaction, unCompactedMessages);
+      console.warn("Chat compaction failed; stopping reply because compaction is required.", error);
+      throw new Error("Compaction failed before the assistant reply could start: " + (error.message || error));
     }
   };
   const resetChatCompaction = () => updateActiveCompaction({ ...DEFAULT_CHAT_COMPACTION, __forceEmpty: true }, { replace: true, forceEmpty: true });
+
+  const pruneCompactionForRewrite = (cutoffTs = 0, options = {}) => {
+    const cutoff = Number(cutoffTs) || 0;
+    if (!cutoff) return;
+    const includeCutoff = !!options.includeCutoff;
+    const current = getActiveCompactionSnapshot();
+    const chunks = (current.chunks || []).filter(chunk => {
+      const fromTs = Number(chunk.fromTs) || Number(chunk.createdAt) || 0;
+      const toTs = Number(chunk.toTs) || fromTs;
+      if (!toTs) return true;
+      return includeCutoff ? toTs <= cutoff : toTs < cutoff;
+    });
+    const compactedThroughTs = chunks.length
+      ? Math.max(...chunks.map(chunk => Number(chunk.toTs) || Number(chunk.fromTs) || 0).filter(Boolean)) || null
+      : null;
+    const nextCompaction = normalizeCompactionState({
+      ...current,
+      chunks,
+      // A legacy summary has no reliable timestamp range, so once a branch is
+      // rewritten it cannot be safely kept. Timestamped chunks are preserved.
+      summary: "",
+      compactedThroughTs,
+      updatedAt: Date.now(),
+    });
+
+    if (isCompactionEmptyState(nextCompaction)) {
+      resetChatCompaction();
+      return normalizeCompactionState(DEFAULT_CHAT_COMPACTION);
+    }
+    updateActiveCompaction(nextCompaction, { replace: true });
+    return nextCompaction;
+  };
 
   const buildRequestPayload = (requestMessages) => {
     const payload = {
@@ -5119,18 +5171,34 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
   };
 
   const CHAT_REQUEST_TIMEOUT_MS = 120000;
+  const COMPACTION_REQUEST_TIMEOUT_MS = 60000;
   const MEMORY_REQUEST_TIMEOUT_MS = 45000;
   const IMAGE_REQUEST_TIMEOUT_MS = 180000;
 
-  const fetchWithTimeout = async (url, options = {}, timeoutMs = CHAT_REQUEST_TIMEOUT_MS) => {
+  const fetchWithTimeout = async (url, options = {}, timeoutMs = CHAT_REQUEST_TIMEOUT_MS, timeoutMessage = "Request timed out because the provider stopped responding. Try again, change models, or turn streaming off for this chat.") => {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
     try {
       return await fetch(url, { ...options, signal: options.signal || controller.signal });
     } catch (error) {
       if (error?.name === "AbortError") {
-        throw new Error("Request timed out because the provider stopped responding. Try again, change models, or turn streaming off for this chat.");
+        throw new Error(timeoutMessage);
       }
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  };
+
+  const fetchJsonWithTimeout = async (url, options = {}, timeoutMs = CHAT_REQUEST_TIMEOUT_MS, timeoutMessage = "Request timed out because the provider stopped responding.") => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { ...options, signal: options.signal || controller.signal });
+      const data = await res.json().catch(() => ({}));
+      return { res, data };
+    } catch (error) {
+      if (error?.name === "AbortError") throw new Error(timeoutMessage);
       throw error;
     } finally {
       clearTimeout(timeoutId);
@@ -5234,14 +5302,7 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
 
   const streamChatCompletion = async ({ requestMessages, uiBaseMessages }) => {
     const controller = new AbortController();
-    // Use a resettable inactivity timer so the stream is aborted if no new chunks
-    // arrive for CHAT_REQUEST_TIMEOUT_MS ms. Without this, a stream that starts
-    // but then stalls mid-response hangs the UI on the three dots indefinitely.
-    let timeoutId = setTimeout(() => controller.abort(), CHAT_REQUEST_TIMEOUT_MS);
-    const resetTimeout = () => {
-      clearTimeout(timeoutId);
-      timeoutId = setTimeout(() => controller.abort(), CHAT_REQUEST_TIMEOUT_MS);
-    };
+    const timeoutId = setTimeout(() => controller.abort(), CHAT_REQUEST_TIMEOUT_MS);
     let reader = null;
 
     try {
@@ -5280,7 +5341,6 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
       };
 
       const processChunk = (data) => {
-        resetTimeout(); // reset inactivity timer on every received chunk
         if (!data || data === "[DONE]") return;
         const parsed = JSON.parse(data);
         if (parsed.error) throw new Error(parsed.error.message || "Streaming error");
@@ -5309,7 +5369,7 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
           const rawEvent = buffer.slice(0, boundary);
           buffer = buffer.slice(boundary + 2);
           const dataLines = rawEvent.split(/\r?\n/).filter(line => line.startsWith("data:")).map(line => line.slice(5).trim());
-          if (dataLines.length) processChunk(dataLines.join("\n"));
+          if (dataLines.length) dataLines.forEach(processChunk);
           boundary = buffer.indexOf("\n\n");
         }
         if (done) {
@@ -5419,8 +5479,12 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
     }
 
     const payload = buildRequestPayload(requestMessages);
-    const res = await fetchWithTimeout(apiUrl, { method: "POST", headers, body: JSON.stringify(payload) });
-    const data = await res.json();
+    const { res, data } = await fetchJsonWithTimeout(
+      apiUrl,
+      { method: "POST", headers, body: JSON.stringify(payload) },
+      CHAT_REQUEST_TIMEOUT_MS,
+      "Assistant reply timed out while reading the response body. Try again or change models/providers."
+    );
     if (!res.ok) throw new Error(data.error?.message || "API error");
 
     const choice = data.choices?.[0];
@@ -5588,8 +5652,9 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
     const target = messages[index];
     if (!target || target.role !== "user") return;
     const trimmedMessages = messages.slice(0, index);
-    // Do NOT reset compaction here — the existing chunks remain valid context
-    // and wiping them on every edit was causing all saved chunks to disappear.
+    // Editing rewrites the branch from this user message onward. Keep older
+    // compaction chunks, but remove chunks that overlap or occur after the edit.
+    pruneCompactionForRewrite(target.ts, { includeCutoff: false });
     setMessages(trimmedMessages); persistMessages(trimmedMessages);
     setInput(target.content || ""); setPendingAttachments(normalizeImageAttachments(target.attachments || [])); setImageMode(false); setActiveBubbleMenuId(null);
     requestAnimationFrame(() => textareaRef.current?.focus());
@@ -5600,7 +5665,9 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
     const target = messages[index];
     if (!target) return;
     const baseMessages = target.role === "user" ? messages.slice(0, index + 1) : messages.slice(0, index);
-    // Do NOT reset compaction here — chunks are still valid context for the regenerated reply.
+    // Regeneration rewrites only the reply branch. Keep chunks up through the
+    // prompt being regenerated from, and remove later branch chunks.
+    pruneCompactionForRewrite(target.ts, { includeCutoff: target.role === "user" });
     setActiveBubbleMenuId(null); setLoading(true); setMessages(baseMessages); persistMessages(baseMessages);
     try {
       await requestAssistant(baseMessages);
@@ -6209,6 +6276,8 @@ function App() {
             <div style={{ position: "absolute", top: 54, left: 40, zIndex: 4001, background: theme.bgPanel, border: `1px solid ${theme.borderAccent}`, borderRadius: 10, overflow: "hidden", minWidth: 220, boxShadow: "0 8px 24px rgba(0,0,0,0.5)", maxHeight: "50vh", overflowY: "auto" }}>
               {MODELS.map(m => (
                   <button key={m} onClick={() => {
+                    // Model changes should not delete compaction; existing chunks are
+                    // user-visible continuity state and can remain active.
                     if (activeProject?.id) {
                       setProjects(prev => prev.map(p => p.id === activeProject.id ? mergeProjectPreservingState(p, { apiProvider: activeModelProvider, model: m }) : p));
                     } else {
