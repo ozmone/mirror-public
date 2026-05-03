@@ -72,17 +72,26 @@ const initStorageCache = async () => {
   if (storageInitPromise) return storageInitPromise;
   storageInitPromise = (async () => {
     try {
-      await withStore("readonly", (store) => {
+      const db = await openStorageDb();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, "readonly");
+        const store = tx.objectStore(STORE_NAME);
         const keysReq = store.getAllKeys();
         const valuesReq = store.getAll();
-        keysReq.onsuccess = () => {
-          valuesReq.onsuccess = () => {
-            const keys = keysReq.result || [];
-            const values = valuesReq.result || [];
-            Object.keys(STORAGE_CACHE).forEach(key => delete STORAGE_CACHE[key]);
-            keys.forEach((key, index) => { STORAGE_CACHE[key] = values[index]; });
-          };
+        // Populate cache inside tx.oncomplete so both requests are guaranteed
+        // to have finished before we resolve. The old approach attached nested
+        // onsuccess handlers that could fire after the promise already resolved,
+        // causing the cache to be empty when the app first reads from it —
+        // which meant compaction chunks and other state appeared to vanish on reload.
+        tx.oncomplete = () => {
+          const keys = keysReq.result || [];
+          const values = valuesReq.result || [];
+          Object.keys(STORAGE_CACHE).forEach(key => delete STORAGE_CACHE[key]);
+          keys.forEach((key, index) => { STORAGE_CACHE[key] = values[index]; });
+          resolve();
         };
+        tx.onerror = () => reject(tx.error || new Error("IndexedDB init transaction failed"));
+        tx.onabort = () => reject(tx.error || new Error("IndexedDB init transaction aborted"));
       });
     } catch (error) {
       console.error("Failed to initialize IndexedDB cache", error);
@@ -741,6 +750,27 @@ const normalizeCompactionState = (compaction = {}) => {
     ...raw,
     chunks: Array.isArray(raw.chunks) ? raw.chunks.filter(Boolean) : [],
   };
+};
+
+const isCompactionEmptyState = (compaction = {}) => {
+  const normalized = normalizeCompactionState(compaction);
+  return !String(normalized.summary || "").trim()
+    && !normalized.chunks.length
+    && !normalized.compactedThroughTs
+    && !normalized.updatedAt;
+};
+
+const stripCompactionControlFlags = (compaction = {}) => {
+  const clean = { ...(compaction || {}) };
+  delete clean.__merge;
+  delete clean.__replace;
+  delete clean.__forceEmpty;
+  return clean;
+};
+
+const shouldIgnoreBlankCompactionWrite = (compaction = {}, options = {}) => {
+  if (options.forceEmpty || options.replace) return false;
+  return isCompactionEmptyState(compaction);
 };
 
 const chunkIdentity = (chunk = {}) =>
@@ -4532,8 +4562,14 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
   const projectCompaction = { ...DEFAULT_CHAT_COMPACTION, ...(project?.projectCompaction || {}), chunks: Array.isArray(project?.projectCompaction?.chunks) ? project.projectCompaction.chunks : [] };
   const activeCompactionState = projectGlobalContextEnabled ? projectCompaction : chatCompaction;
   const updateActiveCompaction = (nextCompaction, options = {}) => {
-    const normalized = normalizeCompactionState(nextCompaction);
-    const payload = { ...normalized, __merge: !options.replace, __replace: !!options.replace };
+    const forceEmpty = !!nextCompaction?.__forceEmpty || !!options.forceEmpty;
+    const normalized = normalizeCompactionState(stripCompactionControlFlags(nextCompaction));
+
+    // Blank/default compaction is allowed as a read fallback, but it must never be
+    // persisted as real project/chat state unless an intentional reset says so.
+    if (isCompactionEmptyState(normalized) && !forceEmpty) return;
+
+    const payload = { ...normalized, __merge: !options.replace, __replace: !!options.replace, __forceEmpty: forceEmpty };
     if (projectGlobalContextEnabled) onUpdateProjectCompaction?.(payload);
     else onUpdateChatCompaction?.(payload);
   };
@@ -4625,6 +4661,10 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
     if (availableTools.length) {
       blocks.push(`## Available Lookup Tools\nUse these tools when you need specific details — do not guess.\n${availableTools.map(l => `- ${l}`).join("\n")}`);
       blocks.push("## Tool Follow-Through\nTool results are intermediate information, not the final answer. After any lookup or tool result, continue the user's original request in the same response. Use the returned data to complete the action, calculation, narration, comparison, edit, explanation, or next requested step. Do not stop after merely repeating what the tool returned.");
+    }
+
+    if (memorySettings.retention !== "manual") {
+      blocks.push("## Memory Autonomy\nMemory retention is enabled. Preserve durable, reusable information without waiting for the user to repeat it. When the user explicitly says to remember/save/note something, save it. When important canon, preferences, settings, relationships, decisions, or long-term project facts emerge, save them. Skip ordinary temporary actions, filler, and duplicates.");
     }
 
     return blocks.filter(Boolean).join("\n\n");
@@ -4942,7 +4982,7 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
       ],
       temperature: 0, top_p: 1, max_tokens: safeMaxTokens, ...providerPrivacyFields,
     };
-    const res = await fetch(apiUrl, { method: "POST", headers, body: JSON.stringify(payload) });
+    const res = await fetchWithTimeout(apiUrl, { method: "POST", headers, body: JSON.stringify(payload) });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error?.message || "Compaction API error");
     return enforceCompactionBudget(data.choices?.[0]?.message?.content || "", safeMaxTokens);
@@ -4963,7 +5003,7 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
       ],
       temperature: 0, top_p: 1, max_tokens: safeMaxTokens, ...providerPrivacyFields,
     };
-    const res = await fetch(apiUrl, { method: "POST", headers, body: JSON.stringify(payload) });
+    const res = await fetchWithTimeout(apiUrl, { method: "POST", headers, body: JSON.stringify(payload) });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error?.message || "Chunk merge API error");
     const fallback = chunksToMerge.map(c => c.text || "").join("\n\n");
@@ -5050,7 +5090,7 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
       return getContextMessages(baseMessages, activeCompaction, unCompactedMessages);
     }
   };
-  const resetChatCompaction = () => updateActiveCompaction({ ...DEFAULT_CHAT_COMPACTION }, { replace: true });
+  const resetChatCompaction = () => updateActiveCompaction({ ...DEFAULT_CHAT_COMPACTION, __forceEmpty: true }, { replace: true, forceEmpty: true });
 
   const buildRequestPayload = (requestMessages) => {
     const payload = {
@@ -5078,88 +5118,223 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
     ...(apiProvider === "openrouter" ? { "HTTP-Referer": "https://localhost", "X-Title": "Roleplay App" } : {}),
   };
 
+  const CHAT_REQUEST_TIMEOUT_MS = 120000;
+  const MEMORY_REQUEST_TIMEOUT_MS = 45000;
+  const IMAGE_REQUEST_TIMEOUT_MS = 180000;
+
+  const fetchWithTimeout = async (url, options = {}, timeoutMs = CHAT_REQUEST_TIMEOUT_MS) => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, { ...options, signal: options.signal || controller.signal });
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        throw new Error("Request timed out because the provider stopped responding. Try again, change models, or turn streaming off for this chat.");
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  };
+
   const toAssistantMessage = (content, tokenCount, tokenEstimated, extra = {}) => ({
     role: "assistant", content: content || "", ts: Date.now(),
     tokenCount: tokenCount ?? estimateTokens(content || ""),
     tokenEstimated, ...extra,
   });
 
-  const streamChatCompletion = async ({ requestMessages, uiBaseMessages }) => {
-    const res = await fetch(apiUrl, { method: "POST", headers, body: JSON.stringify(buildRequestPayload(requestMessages)) });
-    if (!res.ok) {
-      let errText = "API error";
-      try { const errData = await res.json(); errText = errData.error?.message || errText; }
-      catch { const text = await res.text(); if (text) errText = text; }
-      throw new Error(errText);
+  const extractJsonArray = (text = "") => {
+    const raw = String(text || "").trim().replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      const start = raw.indexOf("[");
+      const end = raw.lastIndexOf("]");
+      if (start >= 0 && end > start) {
+        try {
+          const parsed = JSON.parse(raw.slice(start, end + 1));
+          return Array.isArray(parsed) ? parsed : [];
+        } catch {}
+      }
     }
-    if (!res.body) throw new Error("Streaming response body was empty.");
+    return [];
+  };
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "", content = "", usage = null;
-    const toolCallMap = new Map();
-    let renderedPartial = false;
+  const runAutonomousMemoryCapture = async (finalMessages = []) => {
+    const memorySettings = getProjectMemorySettings(project);
+    if (memorySettings.retention === "manual") return;
+    if (!apiKey) return;
 
-    const getToolCalls = () => Array.from(toolCallMap.entries()).sort((a, b) => a[0] - b[0]).map(([, value]) => ({
-      id: value.id || `tool_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-      type: "function",
-      function: { name: value.function?.name || "", arguments: value.function?.arguments || "{}" },
-    }));
+    const visibleMessages = (Array.isArray(finalMessages) ? finalMessages : [])
+      .filter(m => ["user", "assistant"].includes(m?.role) && !m?.pending && !m?.error && String(m?.content || "").trim())
+      .slice(-8);
+    if (visibleMessages.length < 2) return;
 
-    const renderPartial = () => {
-      if (!content) return;
-      renderedPartial = true;
-      const partial = toAssistantMessage(content, usage?.completion_tokens, usage?.completion_tokens == null, { _streaming: true });
-      const partialMessages = [...uiBaseMessages, partial];
-      setMessages(partialMessages); persistMessages(partialMessages);
+    const existing = normalizeProjectMemory(project.memory || [], project.id);
+    const existingText = existing.slice(-80).map(m => `- ${getMemoryContent(m)}`).join("\n");
+    const transcript = visibleMessages.map(m => `${String(m.role || "message").toUpperCase()}: ${String(m.content || "").slice(0, 4000)}`).join("\n\n");
+    const status = memorySettings.retention === "review" ? "pending" : "active";
+
+    const payload = {
+      model: requestModel || settings.model || "openai/gpt-4o-2024-11-20",
+      messages: [
+        { role: "system", content: "You are the private memory curator for a chat/roleplay app. Extract only durable, reusable memories worth keeping for future turns. Return strict JSON only: an array of objects with content, category, tags, importance, and reason. Use [] when nothing should be saved. Do not save ordinary temporary actions, transient emotions, duplicate facts, or tool output by itself." },
+        { role: "user", content: `Project memory mode: ${memorySettings.type}. Save status will be: ${status}.\nAllowed categories: ${MEMORY_CATEGORIES.join(", ")}\nExisting memories to avoid duplicating:\n${existingText || "none"}\n\nRecent conversation:\n${transcript}\n\nReturn at most 3 new memories as JSON array. Content must be concise and standalone.` },
+      ],
+      temperature: 0,
+      top_p: 1,
+      max_tokens: 900,
+      ...providerPrivacyFields,
     };
 
-    const processChunk = (data) => {
-      if (!data || data === "[DONE]") return;
-      const parsed = JSON.parse(data);
-      if (parsed.error) throw new Error(parsed.error.message || "Streaming error");
-      if (parsed.usage) usage = parsed.usage;
-      const choice = parsed.choices?.[0];
-      const delta = choice?.delta || {};
-      if (typeof delta.content === "string") { content += delta.content; renderPartial(); }
-      if (Array.isArray(delta.tool_calls)) {
-        delta.tool_calls.forEach((call, index) => {
-          const mapIndex = call.index ?? index;
-          const current = toolCallMap.get(mapIndex) || { id: "", type: "function", function: { name: "", arguments: "" } };
-          if (call.id) current.id = `${current.id || ""}${call.id}`;
-          if (call.type) current.type = call.type;
-          if (call.function?.name) current.function.name = `${current.function.name || ""}${call.function.name}`;
-          if (call.function?.arguments) current.function.arguments = `${current.function.arguments || ""}${call.function.arguments}`;
-          toolCallMap.set(mapIndex, current);
+    try {
+      const res = await fetchWithTimeout(apiUrl, { method: "POST", headers, body: JSON.stringify(payload) }, MEMORY_REQUEST_TIMEOUT_MS);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error?.message || "Memory capture API error");
+      const items = extractJsonArray(data.choices?.[0]?.message?.content || "").slice(0, 3);
+      if (!items.length) return;
+      const now = Date.now();
+      const incoming = items.map(item => normalizeMemory({
+        id: makeId(status === "pending" ? "mem_pending" : "mem_auto"),
+        projectId: project.id,
+        content: item?.content,
+        category: item?.category || (memorySettings.type === "fiction" ? "world" : "other"),
+        tags: Array.isArray(item?.tags) ? item.tags : [],
+        importance: item?.importance || 3,
+        status,
+        source: status === "pending" ? "auto-review" : "auto",
+        reason: item?.reason || "Autonomous memory capture",
+        createdAt: now,
+        updatedAt: now,
+      }, project.id)).filter(m => getMemoryContent(m));
+      if (!incoming.length) return;
+
+      onUpdateMemory((currentMemory = []) => {
+        const currentMems = normalizeProjectMemory(currentMemory || [], project.id);
+        const seen = new Set(currentMems.map(m => getMemoryContent(m).toLowerCase()));
+        const additions = incoming.filter(m => {
+          const key = getMemoryContent(m).toLowerCase();
+          if (!key || seen.has(key)) return false;
+          seen.add(key);
+          return true;
         });
-      }
+        if (!additions.length) return currentMems;
+        if (status === "pending") {
+          const pendingCount = currentMems.filter(m => m.status === "pending").length;
+          const room = Math.max(0, memorySettings.pendingLimit - pendingCount);
+          return [...currentMems, ...additions.slice(0, room)];
+        }
+        return [...currentMems, ...additions];
+      });
+    } catch (error) {
+      console.warn("Autonomous memory capture failed; continuing without saving memory.", error);
+    }
+  };
+
+  const streamChatCompletion = async ({ requestMessages, uiBaseMessages }) => {
+    const controller = new AbortController();
+    // Use a resettable inactivity timer so the stream is aborted if no new chunks
+    // arrive for CHAT_REQUEST_TIMEOUT_MS ms. Without this, a stream that starts
+    // but then stalls mid-response hangs the UI on the three dots indefinitely.
+    let timeoutId = setTimeout(() => controller.abort(), CHAT_REQUEST_TIMEOUT_MS);
+    const resetTimeout = () => {
+      clearTimeout(timeoutId);
+      timeoutId = setTimeout(() => controller.abort(), CHAT_REQUEST_TIMEOUT_MS);
     };
+    let reader = null;
 
-    while (true) {
-      const { value, done } = await reader.read();
-      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
-      let boundary = buffer.indexOf("\n\n");
-      while (boundary !== -1) {
-        const rawEvent = buffer.slice(0, boundary);
-        buffer = buffer.slice(boundary + 2);
-        const dataLines = rawEvent.split(/\r?\n/).filter(line => line.startsWith("data:")).map(line => line.slice(5).trim());
-        if (dataLines.length) processChunk(dataLines.join("\n"));
-        boundary = buffer.indexOf("\n\n");
+    try {
+      const res = await fetch(apiUrl, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(buildRequestPayload(requestMessages)),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        let errText = "API error";
+        try { const errData = await res.json(); errText = errData.error?.message || errText; }
+        catch { const text = await res.text(); if (text) errText = text; }
+        throw new Error(errText);
       }
-      if (done) {
-        const tail = buffer.trim();
-        if (tail) tail.split(/\r?\n/).filter(line => line.startsWith("data:")).map(line => line.slice(5).trim()).forEach(processChunk);
-        break;
-      }
-    }
+      if (!res.body) throw new Error("Streaming response body was empty.");
 
-    const toolCalls = getToolCalls();
-    const assistantMsg = toAssistantMessage(content, usage?.completion_tokens, usage?.completion_tokens == null, toolCalls.length ? { tool_calls: toolCalls } : {});
-    if (renderedPartial || assistantMsg.content) {
-      const finalUiMessages = [...uiBaseMessages, assistantMsg];
-      setMessages(finalUiMessages); persistMessages(finalUiMessages);
+      reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "", content = "", usage = null;
+      const toolCallMap = new Map();
+      let renderedPartial = false;
+
+      const getToolCalls = () => Array.from(toolCallMap.entries()).sort((a, b) => a[0] - b[0]).map(([, value]) => ({
+        id: value.id || `tool_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        type: "function",
+        function: { name: value.function?.name || "", arguments: value.function?.arguments || "{}" },
+      }));
+
+      const renderPartial = () => {
+        if (!content) return;
+        renderedPartial = true;
+        const partial = toAssistantMessage(content, usage?.completion_tokens, usage?.completion_tokens == null, { _streaming: true });
+        const partialMessages = [...uiBaseMessages, partial];
+        setMessages(partialMessages); persistMessages(partialMessages);
+      };
+
+      const processChunk = (data) => {
+        resetTimeout(); // reset inactivity timer on every received chunk
+        if (!data || data === "[DONE]") return;
+        const parsed = JSON.parse(data);
+        if (parsed.error) throw new Error(parsed.error.message || "Streaming error");
+        if (parsed.usage) usage = parsed.usage;
+        const choice = parsed.choices?.[0];
+        const delta = choice?.delta || {};
+        if (typeof delta.content === "string") { content += delta.content; renderPartial(); }
+        if (Array.isArray(delta.tool_calls)) {
+          delta.tool_calls.forEach((call, index) => {
+            const mapIndex = call.index ?? index;
+            const current = toolCallMap.get(mapIndex) || { id: "", type: "function", function: { name: "", arguments: "" } };
+            if (call.id) current.id = `${current.id || ""}${call.id}`;
+            if (call.type) current.type = call.type;
+            if (call.function?.name) current.function.name = `${current.function.name || ""}${call.function.name}`;
+            if (call.function?.arguments) current.function.arguments = `${current.function.arguments || ""}${call.function.arguments}`;
+            toolCallMap.set(mapIndex, current);
+          });
+        }
+      };
+
+      while (true) {
+        const { value, done } = await reader.read();
+        buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+        let boundary = buffer.indexOf("\n\n");
+        while (boundary !== -1) {
+          const rawEvent = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          const dataLines = rawEvent.split(/\r?\n/).filter(line => line.startsWith("data:")).map(line => line.slice(5).trim());
+          if (dataLines.length) processChunk(dataLines.join("\n"));
+          boundary = buffer.indexOf("\n\n");
+        }
+        if (done) {
+          const tail = buffer.trim();
+          if (tail) tail.split(/\r?\n/).filter(line => line.startsWith("data:")).map(line => line.slice(5).trim()).forEach(processChunk);
+          break;
+        }
+      }
+
+      const toolCalls = getToolCalls();
+      const assistantMsg = toAssistantMessage(content, usage?.completion_tokens, usage?.completion_tokens == null, toolCalls.length ? { tool_calls: toolCalls } : {});
+      if (renderedPartial || assistantMsg.content || assistantMsg.tool_calls?.length) {
+        const finalUiMessages = [...uiBaseMessages, assistantMsg];
+        setMessages(finalUiMessages); persistMessages(finalUiMessages);
+      }
+      return assistantMsg;
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        throw new Error("Request timed out because the stream stopped responding. Try again, change models, or turn streaming off for this chat.");
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+      try { await reader?.cancel?.(); } catch {}
     }
-    return assistantMsg;
   };
 
   const runToolLoop = async ({ initialRequestMessages, initialUiMessages, firstAssistantMsg, maxRounds = 4 }) => {
@@ -5171,6 +5346,7 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
       if (!assistantMsg?.tool_calls?.length) {
         const finalMessages = [...uiMessages, assistantMsg];
         setMessages(finalMessages); persistMessages(finalMessages);
+        runAutonomousMemoryCapture(finalMessages);
         return finalMessages;
       }
 
@@ -5195,7 +5371,7 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
         assistantMsg = await streamChatCompletion({ requestMessages, uiBaseMessages: uiMessages });
       } else {
         const followPayload = buildRequestPayload(requestMessages);
-        const followUp = await fetch(apiUrl, { method: "POST", headers, body: JSON.stringify(followPayload) });
+        const followUp = await fetchWithTimeout(apiUrl, { method: "POST", headers, body: JSON.stringify(followPayload) });
         const followData = await followUp.json();
         if (!followUp.ok) throw new Error(followData.error?.message || "API error");
         const msg = followData.choices?.[0]?.message || {};
@@ -5238,11 +5414,12 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
       }
       const finalMessages = [...baseMessages, assistantMsg];
       setMessages(finalMessages); persistMessages(finalMessages);
+      runAutonomousMemoryCapture(finalMessages);
       return finalMessages;
     }
 
     const payload = buildRequestPayload(requestMessages);
-    const res = await fetch(apiUrl, { method: "POST", headers, body: JSON.stringify(payload) });
+    const res = await fetchWithTimeout(apiUrl, { method: "POST", headers, body: JSON.stringify(payload) });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error?.message || "API error");
 
@@ -5268,6 +5445,7 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
     const aiMsg = { role: "assistant", content: aiText, ts: Date.now(), tokenCount: firstPassTokens ?? estimateTokens(aiText), tokenEstimated: firstPassTokens == null };
     const finalMessages = [...baseMessages, aiMsg];
     setMessages(finalMessages); persistMessages(finalMessages);
+    runAutonomousMemoryCapture(finalMessages);
     return finalMessages;
   };
 
@@ -5330,7 +5508,7 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
         image_config: { image_size: "1K" },
         ...buildOpenRouterPrivacyFields(settings),
       };
-      const res = await fetch(`${getProviderApiBase("openrouter")}/chat/completions`, {
+      const res = await fetchWithTimeout(`${getProviderApiBase("openrouter")}/chat/completions`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -5339,7 +5517,7 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
           "X-Title": "Mirror App",
         },
         body: JSON.stringify(body),
-      });
+      }, IMAGE_REQUEST_TIMEOUT_MS);
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error?.message || `OpenRouter image generation API error. Check Image Settings → Image model; the selected model was ${imageModel}.`);
       const urls = extractGeneratedImageUrls(data);
@@ -5374,11 +5552,11 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
           const name = img.name || `input-${index + 1}.png`;
           form.append("image[]", blob, name);
         }
-        res = await fetch(endpoint, {
+        res = await fetchWithTimeout(endpoint, {
           method: "POST",
           headers: { Authorization: `Bearer ${providerKey}` },
           body: form,
-        });
+        }, IMAGE_REQUEST_TIMEOUT_MS);
       } else {
         const body = {
           model: imageModel,
@@ -5388,11 +5566,11 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
           quality: getOpenAIImageQuality(chatOptions),
           output_format: "png",
         };
-        res = await fetch(endpoint, {
+        res = await fetchWithTimeout(endpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${providerKey}` },
           body: JSON.stringify(body),
-        });
+        }, IMAGE_REQUEST_TIMEOUT_MS);
       }
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error?.message || `OpenAI image API error. Check Image Settings → Image model; the selected model was ${imageModel}.`);
@@ -5410,7 +5588,8 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
     const target = messages[index];
     if (!target || target.role !== "user") return;
     const trimmedMessages = messages.slice(0, index);
-    resetChatCompaction();
+    // Do NOT reset compaction here — the existing chunks remain valid context
+    // and wiping them on every edit was causing all saved chunks to disappear.
     setMessages(trimmedMessages); persistMessages(trimmedMessages);
     setInput(target.content || ""); setPendingAttachments(normalizeImageAttachments(target.attachments || [])); setImageMode(false); setActiveBubbleMenuId(null);
     requestAnimationFrame(() => textareaRef.current?.focus());
@@ -5421,16 +5600,18 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
     const target = messages[index];
     if (!target) return;
     const baseMessages = target.role === "user" ? messages.slice(0, index + 1) : messages.slice(0, index);
-    resetChatCompaction();
+    // Do NOT reset compaction here — chunks are still valid context for the regenerated reply.
     setActiveBubbleMenuId(null); setLoading(true); setMessages(baseMessages); persistMessages(baseMessages);
-    try { await requestAssistant(baseMessages); }
-    catch (err) {
+    try {
+      await requestAssistant(baseMessages);
+    } catch (err) {
       const errText = makeFriendlyErrorMessage(err, baseMessages);
       const errMsg = { role: "assistant", content: errText, ts: Date.now(), tokenCount: estimateTokens(errText), tokenEstimated: true, error: true };
       const finalMessages = [...baseMessages, errMsg];
       setMessages(finalMessages); persistMessages(finalMessages);
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   const sendMessage = async () => {
@@ -5458,16 +5639,16 @@ function ChatScreen({ t, fonts, project, chat, messages, setMessages, settings, 
       } else {
         await requestAssistant(newMessages);
       }
-    }
-    catch (err) {
+    } catch (err) {
       const errText = requestAsImage ? `⚠ Image generation failed: ${err.message || err}` : makeFriendlyErrorMessage(err, newMessages);
       const errMsg = { id: makeId("err"), role: "assistant", content: errText, ts: Date.now(), tokenCount: estimateTokens(errText), tokenEstimated: true, error: true };
       const finalMessages = requestAsImage
         ? workingMessages.map(msg => msg.id === pendingImageMsgId ? errMsg : msg)
         : [...newMessages, errMsg];
       setMessages(finalMessages); persistMessages(finalMessages);
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   const handleExportChat = () => {
@@ -5889,9 +6070,19 @@ function App() {
     const resolvedValue = typeof value === "function" ? value(p?.[field], p) : value;
     if (field === "projectCompaction") {
       const shouldMerge = !!resolvedValue?.__merge && !resolvedValue?.__replace;
-      const cleanValue = { ...(resolvedValue || {}) };
-      delete cleanValue.__merge; delete cleanValue.__replace;
-      return mergeProjectPreservingState(p, { [field]: shouldMerge ? mergeCompactionStates(p.projectCompaction, cleanValue) : normalizeCompactionState(cleanValue) });
+      const forceEmpty = !!resolvedValue?.__forceEmpty;
+      const cleanValue = stripCompactionControlFlags(resolvedValue);
+      const currentCompaction = normalizeCompactionState(p.projectCompaction);
+      const incomingCompaction = normalizeCompactionState(cleanValue);
+
+      // Never let the DEFAULT_CHAT_COMPACTION fallback overwrite saved project chunks.
+      // Only the explicit reset path may persist an empty compaction object.
+      if (!forceEmpty && isCompactionEmptyState(incomingCompaction)) return p;
+
+      const nextCompaction = shouldMerge
+        ? mergeCompactionStates(currentCompaction, incomingCompaction)
+        : incomingCompaction;
+      return mergeProjectPreservingState(p, { [field]: nextCompaction });
     }
     return mergeProjectPreservingState(p, { [field]: resolvedValue });
   }));
@@ -5899,9 +6090,18 @@ function App() {
   const saveChatCompaction = (chatId, nextCompaction) => setChats(prev => prev.map(c => {
     if (c.id !== chatId) return c;
     const shouldMerge = !!nextCompaction?.__merge && !nextCompaction?.__replace;
-    const cleanCompaction = { ...(nextCompaction || {}) };
-    delete cleanCompaction.__merge; delete cleanCompaction.__replace;
-    const compaction = shouldMerge ? mergeCompactionStates(c.compaction, cleanCompaction) : normalizeCompactionState(cleanCompaction);
+    const forceEmpty = !!nextCompaction?.__forceEmpty;
+    const cleanCompaction = stripCompactionControlFlags(nextCompaction);
+    const currentCompaction = normalizeCompactionState(c.compaction);
+    const incomingCompaction = normalizeCompactionState(cleanCompaction);
+
+    // Never let the DEFAULT_CHAT_COMPACTION fallback overwrite saved chat chunks.
+    // Only the explicit reset path may persist an empty compaction object.
+    if (!forceEmpty && isCompactionEmptyState(incomingCompaction)) return c;
+
+    const compaction = shouldMerge
+      ? mergeCompactionStates(currentCompaction, incomingCompaction)
+      : incomingCompaction;
     return normalizeChat({ ...c, compaction, updatedAt: Date.now() });
   }));
   const persistMessagesForChat = (chatId, msgs) => {
